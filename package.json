@@ -8,7 +8,9 @@
   "files": ["src/index.js", "src/wasm_exec.js", "src/tailnet.wasm"],
   "scripts": {
     "patch": "./scripts/apply-patches.sh",
-    "build": "./scripts/apply-patches.sh && ./scripts/build-wasm.sh"
+    "build": "./scripts/apply-patches.sh && ./scripts/build-wasm.sh",
+    "test": "./scripts/apply-patches.sh && ./scripts/test-patches.sh && ./scripts/test-go.sh",
+    "test:e2e": "./test/local-tailnet/run.sh"
   },
   "license": "MIT"
 }

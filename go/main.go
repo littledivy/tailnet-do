@@ -7,6 +7,7 @@
 //	                        dnsQuery(Uint8Array) -> Promise<Uint8Array>
 //	                        log(line)
 //	newNode(config) -> node
+//	useACMEDirectory(url) -> error message or ""
 //
 // One Go runtime per isolate can host many nodes. A JS socket ("sock") is any
 // object with read() -> Promise<Uint8Array|null>, write(u8) -> Promise,
@@ -16,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +35,7 @@ import (
 	"time"
 
 	"tailscale.com/control/controlclient"
+	"tailscale.com/feature/acme"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnlocal"
 	"tailscale.com/ipn/store/mem"
@@ -56,6 +60,14 @@ func main() {
 	}))
 	api.Set("newNode", js.FuncOf(func(_ js.Value, a []js.Value) any {
 		return newNode(a[0])
+	}))
+	// useACMEDirectory(url) -> "" or an error message. Called before
+	// serveHTTPS; url "" is the default directory.
+	api.Set("useACMEDirectory", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		if err := useACMEDirectory(a[0].String()); err != nil {
+			return err.Error()
+		}
+		return ""
 	}))
 	js.Global().Set("__tailnet", api)
 	<-make(chan bool)
@@ -318,8 +330,15 @@ type node struct {
 	dialer *tsdial.Dialer
 
 	mu        sync.Mutex
-	listeners map[uint16]func(net.Conn, netip.AddrPort) // port -> handler
+	listeners map[uint16]portListener
+	certs     *certManager // nil until the first serveHTTPS
 	httpc     *http.Client
+}
+
+// portListener receives the tailnet TCP connections to one port.
+type portListener struct {
+	handle func(net.Conn, netip.AddrPort)
+	close  func() // called when the port is unlistened or taken over; may be nil
 }
 
 func newNode(cfg js.Value) js.Value {
@@ -329,7 +348,7 @@ func newNode(cfg js.Value) js.Value {
 		}
 		return ""
 	}
-	n := &node{listeners: map[uint16]func(net.Conn, netip.AddrPort){}}
+	n := &node{listeners: map[uint16]portListener{}}
 	onStatus := cfg.Get("onStatus")
 	status := func(kv map[string]any) {
 		if onStatus.Type() == js.TypeFunction {
@@ -362,7 +381,7 @@ func newNode(cfg js.Value) js.Value {
 		cb := a[1]
 		n.setListener(uint16(a[0].Int()), func(c net.Conn, src netip.AddrPort) {
 			cb.Invoke(exportConn(c), n.whois(src))
-		})
+		}, nil)
 		return nil
 	}))
 
@@ -373,8 +392,47 @@ func newNode(cfg js.Value) js.Value {
 		n.serveHTTP(uint16(a[0].Int()), a[1])
 		return nil
 	}))
+
+	// serveHTTPS(port, handler) -> Promise<{domain, expiry}>: serveHTTP
+	// behind TLS, with the certificate Tailscale issues for the node's
+	// MagicDNS name. The port accepts connections at once and handshakes
+	// wait for the certificate. The promise settles with the next attempt
+	// to get one, which waits for the node to be running; after a failure
+	// the node keeps retrying.
+	o.Set("serveHTTPS", js.FuncOf(func(_ js.Value, a []js.Value) any {
+		ready := n.serveHTTPS(uint16(a[0].Int()), a[1])
+		return promise(func() (any, error) {
+			info, err := ready()
+			if err != nil {
+				return nil, err
+			}
+			return jsonValue(info.js()), nil
+		})
+	}))
+
+	// renewCert() -> Promise<{domain, expiry}>: issue a new certificate
+	// now instead of waiting for it to be due.
+	o.Set("renewCert", js.FuncOf(func(js.Value, []js.Value) any {
+		return promise(func() (any, error) {
+			n.mu.Lock()
+			m := n.certs
+			n.mu.Unlock()
+			if m == nil {
+				return nil, errors.New("there is no certificate to renew: serveHTTPS has not been called")
+			}
+			// No deadline of our own: every load is bounded, and
+			// giving up on an issuance that then succeeds would
+			// only invite another one.
+			if _, err := m.renew(context.Background()); err != nil {
+				return nil, err
+			}
+			info, _ := m.info()
+			return jsonValue(info.js()), nil
+		})
+	}))
+
 	o.Set("unlisten", js.FuncOf(func(_ js.Value, a []js.Value) any {
-		n.setListener(uint16(a[0].Int()), nil)
+		n.setListener(uint16(a[0].Int()), nil, nil)
 		return nil
 	}))
 
@@ -508,6 +566,12 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 	lb.SetNotifyCallback(func(nt ipn.Notify) {
 		if nt.State != nil {
 			status(map[string]any{"state": nt.State.String()})
+			n.mu.Lock()
+			certs := n.certs
+			n.mu.Unlock()
+			if certs != nil {
+				certs.stateChanged()
+			}
 			if *nt.State == ipn.NeedsLogin && authKey == "" {
 				go lb.StartLoginInteractive(context.Background())
 			}
@@ -523,7 +587,7 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 		}
 	})
 
-	return lb.Start(ipn.Options{
+	if err := lb.Start(ipn.Options{
 		UpdatePrefs: &ipn.Prefs{
 			ControlURL:      controlURL,
 			WantRunning:     true,
@@ -532,7 +596,18 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 			AdvertiseTags:   tags,
 		},
 		AuthKey: authKey,
-	})
+	}); err != nil {
+		return err
+	}
+	// Start logs in by itself only when the state store has a node key. A
+	// new node with an auth key has to be told to, once, here, as tsnet
+	// does. (Without a key, the callback above asks for a login URL.) This
+	// is not repeated on a later NeedsLogin, so logout() and an expired
+	// node key leave the node logged out.
+	if authKey != "" && lb.State() == ipn.NeedsLogin {
+		return lb.StartLoginInteractive(context.Background())
+	}
+	return nil
 }
 
 func (n *node) tcpHandlerForFlow(src, dst netip.AddrPort) (func(net.Conn), bool) {
@@ -540,21 +615,28 @@ func (n *node) tcpHandlerForFlow(src, dst netip.AddrPort) (func(net.Conn), bool)
 		return nil, false
 	}
 	n.mu.Lock()
-	h, ok := n.listeners[dst.Port()]
+	l, ok := n.listeners[dst.Port()]
 	n.mu.Unlock()
 	if !ok {
 		return nil, false
 	}
-	return func(c net.Conn) { h(c, src) }, true
+	return func(c net.Conn) { l.handle(c, src) }, true
 }
 
-func (n *node) setListener(port uint16, h func(net.Conn, netip.AddrPort)) {
+// setListener makes handle receive the connections to port, replacing the
+// port's current listener, or removes the listener if handle is nil. close
+// is called once when this listener is removed or replaced.
+func (n *node) setListener(port uint16, handle func(net.Conn, netip.AddrPort), close func()) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
-	if h == nil {
+	prev := n.listeners[port]
+	if handle == nil {
 		delete(n.listeners, port)
 	} else {
-		n.listeners[port] = h
+		n.listeners[port] = portListener{handle: handle, close: close}
+	}
+	n.mu.Unlock()
+	if prev.close != nil {
+		prev.close()
 	}
 }
 
@@ -563,6 +645,10 @@ type chanListener struct {
 	ch     chan net.Conn
 	closed chan struct{}
 	once   sync.Once
+}
+
+func newChanListener() *chanListener {
+	return &chanListener{ch: make(chan net.Conn), closed: make(chan struct{})}
 }
 
 func (l *chanListener) Accept() (net.Conn, error) {
@@ -576,22 +662,82 @@ func (l *chanListener) Accept() (net.Conn, error) {
 func (l *chanListener) Close() error   { l.once.Do(func() { close(l.closed) }); return nil }
 func (l *chanListener) Addr() net.Addr { return &net.TCPAddr{} }
 
-type whoisKey struct{}
+// deliver hands a connection from netstack to Accept.
+func (l *chanListener) deliver(c net.Conn, _ netip.AddrPort) {
+	select {
+	case l.ch <- c:
+	case <-l.closed:
+		c.Close()
+	}
+}
 
 func (n *node) serveHTTP(port uint16, handler js.Value) {
-	ln := &chanListener{ch: make(chan net.Conn), closed: make(chan struct{})}
-	n.setListener(port, func(c net.Conn, _ netip.AddrPort) {
-		select {
-		case ln.ch <- c:
-		case <-ln.closed:
-			c.Close()
-		}
+	ln := newChanListener()
+	srv := &http.Server{Handler: n.httpHandler("http", handler)}
+	n.setListener(port, ln.deliver, func() { srv.Close(); ln.Close() })
+	go srv.Serve(ln)
+}
+
+// serveHTTPS is serveHTTP behind TLS. The returned func blocks until a
+// certificate is in place, the next attempt to get one has failed, or the
+// listener is closed.
+func (n *node) serveHTTPS(port uint16, handler js.Value) func() (*certInfo, error) {
+	n.mu.Lock()
+	if n.certs == nil {
+		n.certs = newCertManager(logf, n.certDomain, func(ctx context.Context, domain string, minValidity time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
+			return n.lb.GetCertPEMWithValidity(ctx, domain, minValidity)
+		})
+	}
+	m := n.certs
+	n.mu.Unlock()
+
+	ready := m.watch() // before acquire, which may start the load it reports
+	m.acquire()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	ln := newChanListener()
+	srv := &http.Server{Handler: n.httpHandler("https", handler)}
+	n.setListener(port, ln.deliver, func() {
+		srv.Close()
+		ln.Close()
+		cancel(errHTTPSClosed)
+		m.release()
 	})
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	go srv.Serve(tls.NewListener(ln, &tls.Config{
+		GetCertificate: m.getCertificate,
+		NextProtos:     []string{"h2", "http/1.1"},
+	}))
+	return func() (*certInfo, error) { return ready(ctx) }
+}
+
+// certDomain returns the name the node gets its TLS certificate for: its
+// MagicDNS name, when the tailnet has HTTPS certificates enabled.
+func (n *node) certDomain() (string, error) {
+	if n.lb == nil || n.lb.State() != ipn.Running {
+		return "", errNotRunning
+	}
+	nm := n.lb.NetMapNoPeers()
+	if nm == nil {
+		return "", errNotRunning
+	}
+	domains := nm.DNS.CertDomains
+	if len(domains) == 0 {
+		return "", errHTTPSDisabled
+	}
+	if self := strings.TrimSuffix(nm.SelfName(), "."); slices.Contains(domains, self) {
+		return self, nil
+	}
+	return domains[0], nil
+}
+
+type whoisKey struct{}
+
+// httpHandler adapts a JS handler to net/http. scheme is the scheme of the
+// URLs it sees, "http" or "https".
+func (n *node) httpHandler(scheme string, handler js.Value) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		req := js.Global().Get("Object").New()
 		req.Set("method", r.Method)
-		scheme := "http"
 		req.Set("url", scheme+"://"+r.Host+r.URL.RequestURI())
 		harr := js.Global().Get("Array").New()
 		for k, vs := range r.Header {
@@ -621,8 +767,7 @@ func (n *node) serveHTTP(port uint16, handler js.Value) {
 		if b := res.Get("body"); b.Truthy() {
 			w.Write(fromJSBytes(b))
 		}
-	})}
-	go srv.Serve(ln)
+	})
 }
 
 func (n *node) whois(ap netip.AddrPort) js.Value {
@@ -692,6 +837,23 @@ func (n *node) status() js.Value {
 		st["addrs"] = addrs
 		st["peers"] = len(nm.Peers)
 	}
+	// certDomain is the name serveHTTPS gets a certificate for; it is
+	// absent while the tailnet has HTTPS certificates disabled.
+	if d, err := n.certDomain(); err == nil {
+		st["certDomain"] = d
+	}
+	n.mu.Lock()
+	certs := n.certs
+	n.mu.Unlock()
+	if certs != nil {
+		info, err := certs.info()
+		if info != nil {
+			st["certExpiry"] = info.Expiry.UTC().Format(time.RFC3339)
+		}
+		if err != nil {
+			st["certError"] = err.Error()
+		}
+	}
 	return jsonValue(st)
 }
 
@@ -709,6 +871,14 @@ func (s *jsStateStore) WriteState(id ipn.StateKey, bs []byte) error {
 	s.set.Invoke(string(id), hex.EncodeToString(bs))
 	return nil
 }
+
+// StoreTLSCerts makes Tailscale keep TLS certificates and the ACME account
+// key in this store. There is no filesystem for its default, a certs
+// directory.
+func (s *jsStateStore) StoreTLSCerts() bool { return true }
+
+// Importing feature/acme is also what links certificate support in.
+var _ acme.TLSCertStorer = (*jsStateStore)(nil)
 
 func (s *jsStateStore) All() func(yield func(ipn.StateKey, []byte) bool) {
 	return func(func(ipn.StateKey, []byte) bool) {}

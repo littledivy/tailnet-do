@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AbdelH2O <a.hana@aui.ma>
+Date: Thu, 12 Nov 2026 17:18:52 +0000
+Subject: feature/acme: let a state store opt in to holding TLS certs
+
+Certs, their keys and the ACME account key are written to a directory
+under TailscaleVarRoot, except on Kubernetes where they go to the state
+store. A host with a custom ipn.StateStore and no filesystem, such as a
+js/wasm embedder, has no var root, so GetCertPEM fails with "no
+TailscaleVarRoot" and there is no way to persist a cert.
+
+Add TLSCertStorer, an optional interface in the style of
+TLSCertKeyReader and TLSCertKeyWriter. A state store that implements it
+and returns true gets the same certStateStore the Kubernetes path uses,
+with the same keys. Nothing changes for stores that do not implement
+it.
+
+diff --git a/feature/acme/certstore.go b/feature/acme/certstore.go
+index a7b5aea0da22a01cbb2cf4b4b4e574a4b7e74ce8..75c0d1128f3c6990f1c827fa58f51c32d2c9d6af 100644
+--- a/feature/acme/certstore.go
++++ b/feature/acme/certstore.go
+@@ -39,8 +39,9 @@
+ )
+ 
+ // certStore provides a way to perist and retrieve TLS certificates.
+-// As of 2023-02-01, we store certs in directories on disk everywhere
+-// except on Kubernetes, where we use the state store.
++// We store certs in directories on disk everywhere except on Kubernetes
++// and with state stores that implement [TLSCertStorer], where we use the
++// state store.
+ type certStore interface {
+ 	// Read returns the cert and key for domain, if they exist and are valid
+ 	// for now. If they're expired, it returns errCertExpired.
+@@ -80,8 +81,28 @@ func certDir(b *ipnlocal.LocalBackend) (string, error) {
+ 	return full, nil
+ }
+ 
++// TLSCertStorer is optionally implemented by state stores that should
++// hold TLS certs, their private keys and the ACME account key, instead
++// of the certs directory under [ipnlocal.LocalBackend.TailscaleVarRoot].
++//
++// It is meant for hosts that persist state through a custom
++// [ipn.StateStore] and have no filesystem to write to, such as a
++// js/wasm embedder. The keys are the ones used on Kubernetes:
++// "<domain>.crt", "<domain>.key" and "acme-account.key.pem".
++type TLSCertStorer interface {
++	// StoreTLSCerts reports whether TLS certs should be kept in this
++	// state store.
++	StoreTLSCerts() bool
++}
++
+ func (e *extension) getCertStore(b *ipnlocal.LocalBackend) (certStore, error) {
++	if testX509Roots != nil && !testenv.InTest() {
++		panic("use of test hook outside of tests")
++	}
+ 	st := b.Sys().StateStore.Get()
++	if cs, ok := st.(TLSCertStorer); ok && cs.StoreTLSCerts() {
++		return certStateStore{StateStore: st, testRoots: testX509Roots}, nil
++	}
+ 	switch st.(type) {
+ 	case *store.FileStore:
+ 	case *mem.Store:
+@@ -97,9 +118,6 @@ func (e *extension) getCertStore(b *ipnlocal.LocalBackend) (certStore, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	if testX509Roots != nil && !testenv.InTest() {
+-		panic("use of test hook outside of tests")
+-	}
+ 	return certFileStore{dir: dir, testRoots: testX509Roots}, nil
+ }
+ 
+diff --git a/feature/acme/certstore_test.go b/feature/acme/certstore_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3e78237a61d94c491f561d9ed27cc7c4e7205d4
+--- /dev/null
++++ b/feature/acme/certstore_test.go
+@@ -0,0 +1,175 @@
++// Copyright (c) Tailscale Inc & contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++//go:build !ios && !android && !js
++
++package acme
++
++import (
++	"bytes"
++	"context"
++	"crypto/x509"
++	"testing"
++	"time"
++
++	"tailscale.com/hostinfo"
++	"tailscale.com/ipn"
++	"tailscale.com/ipn/ipnlocal"
++	"tailscale.com/ipn/ipnlocal/ipnlocaltest"
++	"tailscale.com/ipn/store/mem"
++	"tailscale.com/tailcfg"
++	"tailscale.com/tsd"
++	"tailscale.com/tstest/acmetest"
++	"tailscale.com/types/logger"
++	"tailscale.com/types/netmap"
++	"tailscale.com/util/eventbus/eventbustest"
++)
++
++// certStorerStore is a custom [ipn.StateStore], as a host without a
++// filesystem would provide, that implements [TLSCertStorer].
++type certStorerStore struct {
++	mem.Store
++	storeCerts bool
++}
++
++func (s *certStorerStore) StoreTLSCerts() bool { return s.storeCerts }
++
++// newBackendWithStore returns a backend that uses st as its state store
++// and has a netmap listing domain as a cert domain.
++func newBackendWithStore(t *testing.T, st ipn.StateStore, domain string) *ipnlocal.LocalBackend {
++	t.Helper()
++	sys := tsd.NewSystemWithBus(eventbustest.NewBus(t))
++	sys.Set(st)
++	b := ipnlocaltest.NewBackendWithSys(t, sys)
++	b.ForTest().SetNetMap(&netmap.NetworkMap{
++		SelfNode: (&tailcfg.Node{}).View(),
++		DNS:      tailcfg.DNSConfig{CertDomains: []string{domain}},
++	})
++	return b
++}
++
++func TestGetCertStoreTLSCertStorer(t *testing.T) {
++	tests := []struct {
++		name       string
++		storeCerts bool
++		varRoot    bool
++		wantState  bool // want certs in the state store
++	}{
++		{name: "opted_in", storeCerts: true, wantState: true},
++		{name: "opted_in_with_var_root", storeCerts: true, varRoot: true, wantState: true},
++		{name: "opted_out", storeCerts: false},
++		{name: "opted_out_with_var_root", storeCerts: false, varRoot: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			st := &certStorerStore{storeCerts: tt.storeCerts}
++			b := newBackendWithStore(t, st, "example.com")
++			if tt.varRoot {
++				b.SetVarRoot(t.TempDir())
++			}
++			cs, err := extOf(t, b).getCertStore(b)
++			if !tt.wantState {
++				if hostinfo.GetEnvType() == hostinfo.Kubernetes {
++					t.Skip("on Kubernetes every custom state store holds certs")
++				}
++				if _, ok := cs.(certStateStore); ok {
++					t.Fatalf("getCertStore = %T; a store that did not opt in must not hold certs", cs)
++				}
++				if tt.varRoot && err != nil {
++					t.Fatalf("getCertStore: %v", err)
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("getCertStore: %v", err)
++			}
++			got, ok := cs.(certStateStore)
++			if !ok {
++				t.Fatalf("getCertStore = %T, want certStateStore", cs)
++			}
++			if got.StateStore != ipn.StateStore(st) {
++				t.Errorf("certStateStore wraps %T, want the backend's state store", got.StateStore)
++			}
++		})
++	}
++}
++
++// TestTLSCertStorerSurvivesRestart checks that a cert issued on a host
++// whose state store implements [TLSCertStorer], and that has no var
++// root, is kept in the state store along with the ACME account key, and
++// that a new backend on the same store serves that cert without
++// ordering another one.
++func TestTLSCertStorerSurvivesRestart(t *testing.T) {
++	const domain = "example.com"
++	s := acmetest.Start(t)
++	s.ChallengeType = "tls-alpn-01"
++	t.Setenv("TS_DEBUG_ACME_DIRECTORY_URL", s.DirectoryURL())
++	roots := x509.NewCertPool()
++	roots.AddCert(s.Root())
++	testX509Roots = roots
++	t.Cleanup(func() { testX509Roots = nil })
++
++	st := &certStorerStore{storeCerts: true}
++
++	b1 := newBackendWithStore(t, st, domain)
++	e1 := extOf(t, b1)
++	cs, err := e1.getCertStore(b1)
++	if err != nil {
++		t.Fatalf("getCertStore: %v", err)
++	}
++	ac, err := e1.acmeClient(cs)
++	if err != nil {
++		t.Fatalf("acmeClient: %v", err)
++	}
++	issued, err := e1.issueACMECert(context.Background(), b1, ac, acmeCertIssueArgs{
++		cs:            cs,
++		logf:          logger.Logf(t.Logf),
++		domain:        domain,
++		challengeType: acmeChallengeTLSALPN01,
++	})
++	if err != nil {
++		t.Fatalf("issueACMECert: %v", err)
++	}
++	for _, key := range []ipn.StateKey{domain + ".crt", domain + ".key", acmePEMName} {
++		if v, err := st.ReadState(key); err != nil || len(v) == 0 {
++			t.Errorf("state store has no %q after issuance: %v", key, err)
++		}
++	}
++	accountKey, err := cs.ACMEKey()
++	if err != nil {
++		t.Fatalf("ACMEKey: %v", err)
++	}
++	b1.Shutdown()
++
++	// "Restart": a new backend on the same state store.
++	b2 := newBackendWithStore(t, st, domain)
++	e2 := extOf(t, b2)
++	orig := getCertPEM
++	getCertPEM = func(context.Context, *extension, *ipnlocal.LocalBackend, certStore, logger.Logf, func(any), string, time.Time, time.Duration) (*ipnlocal.TLSCertKeyPair, error) {
++		t.Error("cert was issued again after restart")
++		return nil, nil
++	}
++	t.Cleanup(func() { getCertPEM = orig })
++	newOrders := s.Requests("/new-order")
++
++	pair, err := b2.GetCertPEM(context.Background(), domain)
++	if err != nil {
++		t.Fatalf("GetCertPEM after restart: %v", err)
++	}
++	if !pair.Cached {
++		t.Error("GetCertPEM after restart: Cached = false, want the stored cert")
++	}
++	if !bytes.Equal(pair.CertPEM, issued.CertPEM) || !bytes.Equal(pair.KeyPEM, issued.KeyPEM) {
++		t.Error("GetCertPEM after restart returned a different cert or key than the one issued")
++	}
++	if n := s.Requests("/new-order"); n != newOrders {
++		t.Errorf("ACME server got %d new orders after restart, want 0", n-newOrders)
++	}
++	cs2, err := e2.getCertStore(b2)
++	if err != nil {
++		t.Fatalf("getCertStore after restart: %v", err)
++	}
++	if got, err := cs2.ACMEKey(); err != nil || !bytes.Equal(got, accountKey) {
++		t.Errorf("ACME account key changed across restart (err = %v)", err)
++	}
++}

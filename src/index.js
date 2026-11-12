@@ -9,6 +9,13 @@ import "./wasm_exec.js";
 import engineWasm from "./tailnet.wasm";
 
 const DEFAULT_DOH = "https://cloudflare-dns.com/dns-query";
+
+/**
+ * Let's Encrypt's staging directory, for the acmeDirectoryURL option. Staging
+ * certificates are not trusted by clients, and staging has far higher rate
+ * limits: use it while developing.
+ */
+export const LETSENCRYPT_STAGING_URL = "https://acme-staging-v02.api.letsencrypt.org/directory";
 const KEEPALIVE_MS = 20_000;
 
 // ---- engine (one per isolate) ------------------------------------------
@@ -134,6 +141,20 @@ function sockToSocket(sock) {
   };
 }
 
+// Response-returning handler -> engine HTTP handler.
+function engineHandler(handler) {
+  return async (req, who) => {
+    const request = new Request(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body ?? null,
+    });
+    const res = await handler(request, who);
+    const body = res.body ? new Uint8Array(await res.arrayBuffer()) : null;
+    return { status: res.status, headers: [...res.headers], body };
+  };
+}
+
 async function requestToEngine(request) {
   const body = request.body ? new Uint8Array(await request.arrayBuffer()) : null;
   return { method: request.method, url: request.url, headers: [...request.headers], body };
@@ -158,6 +179,10 @@ export class Tailnet {
    *   exitNode        Advertise as an exit node.
    *   advertiseRoutes Extra subnet routes to advertise.
    *   dohURL          DoH upstream for exit-node DNS.
+   *   acmeDirectoryURL  ACME directory that issues the serveHTTPS certificate.
+   *                   Defaults to Let's Encrypt; set LETSENCRYPT_STAGING_URL
+   *                   while developing. All nodes that call serveHTTPS in
+   *                   an isolate must use the same one.
    *   keepAlive       Keep the object in memory with an alarm (default true).
    *                   Your alarm() must call tailnet.alarm() if you set your own.
    *   statePrefix     Storage key prefix for Tailscale state (default "tailnet:").
@@ -179,6 +204,7 @@ export class Tailnet {
     const kv = ctx.storage.kv;
     const prefix = options.statePrefix ?? "tailnet:";
     const t = new Tailnet(ctx, options);
+    t.#engine = api;
     t.#node = api.newNode({
       authKey: options.authKey ?? "",
       hostname: options.hostname ?? "",
@@ -200,7 +226,9 @@ export class Tailnet {
   }
 
   #ctx;
+  #engine;
   #node;
+  #acmeDirectoryURL;
   #status = {};
   #statusListeners = new Set();
   #keepAlive;
@@ -208,9 +236,20 @@ export class Tailnet {
   constructor(ctx, options) {
     this.#ctx = ctx;
     this.#keepAlive = options.keepAlive ?? true;
+    this.#acmeDirectoryURL = options.acmeDirectoryURL ?? "";
   }
 
-  /** Current state: { state, name, addrs, peers, loginURL? }. */
+  /**
+   * Current state: { state, name, addrs, peers, loginURL?, certDomain?,
+   * certExpiry?, certError? }.
+   *
+   * certDomain is the name serveHTTPS gets a certificate for. It is absent
+   * until the node is running, and while HTTPS certificates are disabled for
+   * the tailnet. certExpiry (ISO 8601) is set once serveHTTPS has a
+   * certificate. certError says why the last attempt to get it failed. A
+   * renewal that fails in the background is only logged, so watch
+   * certExpiry as well.
+   */
   status() {
     return { ...this.#status, ...this.#node.status() };
   }
@@ -258,17 +297,49 @@ export class Tailnet {
    * whois is { loginName, displayName, nodeName, tags, addr } for the caller.
    */
   serve(port, handler) {
-    this.#node.serveHTTP(port, async (req, who) => {
-      const request = new Request(req.url, {
-        method: req.method,
-        headers: req.headers,
-        body: req.body ?? null,
-      });
-      const res = await handler(request, who);
-      const body = res.body ? new Uint8Array(await res.arrayBuffer()) : null;
-      return { status: res.status, headers: [...res.headers], body };
-    });
+    this.#node.serveHTTP(port, engineHandler(handler));
     return { close: () => this.#node.unlisten(port) };
+  }
+
+  /**
+   * Serve HTTPS on a tailnet port, like serve(), with the certificate
+   * Tailscale issues for the node's MagicDNS name (status().certDomain). The
+   * tailnet needs HTTPS Certificates enabled in the admin console.
+   *
+   * The certificate is stored with the node's state, so it is issued once and
+   * reused across restarts, and it renews on its own.
+   *
+   * Returns { ready, close }. ready resolves with { domain, expiry } once a
+   * certificate is in place, which takes a while if it has to be issued. It
+   * rejects if the attempt to get one fails, e.g. because the tailnet has
+   * HTTPS disabled; the node keeps retrying, and status() has the current
+   * state. ready stays pending for as long as the node is not running, so
+   * do not await it in TailnetObject.onTailnet(): that would hold up
+   * everything else the object does, including the login it may be waiting
+   * for.
+   *
+   * Throws if another node in the isolate serves HTTPS with a different
+   * acmeDirectoryURL.
+   */
+  serveHTTPS(port, handler) {
+    // Tailscale takes the ACME directory from the process environment: one
+    // for the isolate, picked by the first node that serves HTTPS.
+    const conflict = this.#engine.useACMEDirectory(this.#acmeDirectoryURL);
+    if (conflict) throw new Error(conflict);
+    const ready = this.#node.serveHTTPS(port, engineHandler(handler));
+    ready.catch(() => {}); // callers may ignore ready; the error is in status().certError
+    return { ready, close: () => this.#node.unlisten(port) };
+  }
+
+  /**
+   * Replace the serveHTTPS certificate with a newly issued one now. Renewal
+   * is automatic; this is for testing it, or for replacing a certificate
+   * early. Resolves with { domain, expiry }. Every call issues a certificate
+   * and counts against the CA's rate limits (Let's Encrypt: about five a
+   * week for one name), so do not expose it to callers you do not trust.
+   */
+  renewCertificate() {
+    return this.#node.renewCert();
   }
 
   /** Identity of a tailnet peer by "ip:port", or null. */
@@ -305,6 +376,7 @@ export class TailnetObject extends DurableObject {
       authKey: env.TS_AUTHKEY,
       hostname: env.TS_HOSTNAME,
       controlURL: env.TS_CONTROL_URL,
+      acmeDirectoryURL: env.TS_ACME_DIRECTORY_URL,
     };
   }
 

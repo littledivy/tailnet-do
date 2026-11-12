@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AbdelH2O <a.hana@aui.ma>
+Date: Thu, 12 Nov 2026 17:16:07 +0000
+Subject: ipn/ipnlocal: add ServeConfig stub for builds without serve
+
+feature/acme calls LocalBackend.ServeConfig from its cert refresh loop,
+but the ts_omit_serve stubs did not provide it, so a build that omits
+serve and keeps ACME failed to compile:
+
+    feature/acme/refresh.go:88:10: b.ServeConfig undefined
+
+The acme feature does not depend on serve, so this combination should
+build. Return an invalid view, which callers already treat as "no
+serve config".
+
+diff --git a/ipn/ipnlocal/serve_disabled.go b/ipn/ipnlocal/serve_disabled.go
+index 7123ebe3bb112edd107e1cb96521cc57d9f94818..9c2d7e4cd5ddb194bfe0bd5d0dec6060d9da0cdf 100644
+--- a/ipn/ipnlocal/serve_disabled.go
++++ b/ipn/ipnlocal/serve_disabled.go
+@@ -32,6 +32,13 @@ func (*LocalBackend) HasFunnelForHostPort(host string, port uint16) bool {
+ 	return false
+ }
+ 
++// ServeConfig returns an invalid view: there is no serve config in
++// builds without serve. Features that remain linked, such as
++// feature/acme, call it to find the hostnames served over HTTPS.
++func (b *LocalBackend) ServeConfig() ipn.ServeConfigView {
++	return ipn.ServeConfigView{}
++}
++
+ func (b *LocalBackend) vipServicesFromPrefsLocked(prefs ipn.PrefsView) []*tailcfg.VIPService {
+ 	return nil
+ }
