@@ -523,7 +523,7 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 		}
 	})
 
-	return lb.Start(ipn.Options{
+	if err := lb.Start(ipn.Options{
 		UpdatePrefs: &ipn.Prefs{
 			ControlURL:      controlURL,
 			WantRunning:     true,
@@ -532,7 +532,18 @@ func (n *node) start(cfg js.Value, str func(string) string, status func(map[stri
 			AdvertiseTags:   tags,
 		},
 		AuthKey: authKey,
-	})
+	}); err != nil {
+		return err
+	}
+	// Start logs in by itself only when the state store has a node key. A
+	// new node with an auth key has to be told to, once, here, as tsnet
+	// does. (Without a key, the callback above asks for a login URL.) This
+	// is not repeated on a later NeedsLogin, so logout() and an expired
+	// node key leave the node logged out.
+	if authKey != "" && lb.State() == ipn.NeedsLogin {
+		return lb.StartLoginInteractive(context.Background())
+	}
+	return nil
 }
 
 func (n *node) tcpHandlerForFlow(src, dst netip.AddrPort) (func(net.Conn), bool) {
